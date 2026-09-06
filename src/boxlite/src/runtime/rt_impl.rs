@@ -1023,6 +1023,20 @@ impl RuntimeImpl {
                 }
             }
 
+            // Reap unconditionally under `force`, not only when the record
+            // still names a pid. `stop()` sets Stopped and clears `state.pid`,
+            // so a sandbox that outlived it reaches here with nothing left in
+            // the record to signal and the guard above never fires — which is
+            // exactly how `rm -f` came to delete a box's directory out from
+            // under a live VM and still return success.
+            if force && !crate::jailer::reap_box(id) {
+                return Err(BoxliteError::Internal(format!(
+                    "cannot remove box {}: its sandbox processes survived SIGKILL. \
+                     Box state left intact; retry once the processes are gone",
+                    id
+                )));
+            }
+
             // Check if other boxes depend on this box's disks (COW backing references).
             if !force {
                 let dependents = find_boxes_depending_on(self, id.as_ref())?;

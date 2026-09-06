@@ -177,13 +177,21 @@ impl VmmHandlerTrait for ShimHandler {
         // whole tree. `graceful_stop` only signals the recorded pid — the outer
         // bwrap launcher — and a detached box's inner pid-ns tree (inner bwrap +
         // shim + VM) outlives it, since #851 stopped applying `--die-with-parent`
-        // to detached boxes. The whole tree lives in the box's cgroup, so reap it
-        // by id — *after* graceful shutdown, so libkrun can flush its virtio-blk
-        // buffers first (a cgroup kill is a hard kill; reaping mid-flush risks
-        // qcow2 corruption). Best-effort and idempotent.
+        // to detached boxes. So reap by box id — *after* graceful shutdown, so
+        // libkrun can flush its virtio-blk buffers first (the reap escalates to
+        // SIGKILL; reaping mid-flush risks qcow2 corruption).
         let result = self.graceful_stop();
-        crate::jailer::reap_box(&self.box_id);
-        result
+        let reaped = crate::jailer::reap_box(&self.box_id);
+        result?;
+        if !reaped {
+            // The teardown did not take. Saying otherwise is what let a box
+            // disappear from `ps -a` while its VM kept its memory.
+            return Err(BoxliteError::Internal(format!(
+                "box {} still has live sandbox processes after SIGKILL",
+                self.box_id
+            )));
+        }
+        Ok(())
     }
 
     fn metrics(&self) -> BoxliteResult<VmmMetrics> {

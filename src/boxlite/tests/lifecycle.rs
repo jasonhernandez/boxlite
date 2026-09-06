@@ -722,3 +722,101 @@ async fn detach_option_is_stored_in_box_config() {
     // Cleanup
     runtime.remove(box_id.as_str(), true).await.unwrap();
 }
+
+// ============================================================================
+// SANDBOX REAPING TESTS
+//
+// VM-required (see tests/README.md): these assert against real host processes,
+// so they only mean anything with a box actually booted.
+// ============================================================================
+
+/// `stop()` must leave no host process of the box behind.
+///
+/// It used to: the recorded pid is the outer launcher, and a detached box's
+/// inner pid namespace outlives it, so `stop()` returned success while the
+/// guest kept its memory.
+#[tokio::test]
+async fn stop_leaves_no_sandbox_process_behind() {
+    let home = boxlite_test_utils::home::PerTestBoxHome::new();
+    let runtime = BoxliteRuntime::new(BoxliteOptions {
+        home_dir: home.path.clone(),
+        image_registries: common::test_registries(),
+    })
+    .expect("create runtime");
+
+    let handle = runtime.create(common::alpine_opts(), None).await.unwrap();
+    let id: BoxID = handle.id().clone();
+    handle.start().await.unwrap();
+
+    assert!(
+        !boxlite::jailer::box_processes(&id).is_empty(),
+        "a started box must own at least one host process"
+    );
+
+    handle.stop().await.unwrap();
+
+    assert_eq!(
+        boxlite::jailer::box_processes(&id),
+        Vec::<u32>::new(),
+        "stop() reported success, so the box must own no host process"
+    );
+
+    runtime.remove(id.as_str(), false).await.unwrap();
+    let _ = runtime.shutdown(Some(common::TEST_SHUTDOWN_TIMEOUT)).await;
+}
+
+/// `remove(force)` must reap a running box before deleting its state.
+#[tokio::test]
+async fn force_remove_of_a_running_box_leaves_no_sandbox_process_behind() {
+    let home = boxlite_test_utils::home::PerTestBoxHome::new();
+    let runtime = BoxliteRuntime::new(BoxliteOptions {
+        home_dir: home.path.clone(),
+        image_registries: common::test_registries(),
+    })
+    .expect("create runtime");
+
+    let handle = runtime.create(common::alpine_opts(), None).await.unwrap();
+    let id: BoxID = handle.id().clone();
+    handle.start().await.unwrap();
+    assert!(!boxlite::jailer::box_processes(&id).is_empty());
+
+    runtime.remove(id.as_str(), true).await.unwrap();
+
+    assert_eq!(
+        boxlite::jailer::box_processes(&id),
+        Vec::<u32>::new(),
+        "remove(force) reported success, so the box must own no host process"
+    );
+    assert!(runtime.get_info(id.as_str()).await.unwrap().is_none());
+
+    let _ = runtime.shutdown(Some(common::TEST_SHUTDOWN_TIMEOUT)).await;
+}
+
+/// `remove(force)` after a `stop()` must still find nothing to reap.
+///
+/// This is the sequence that leaked in practice: `stop()` clears the recorded
+/// pid, so the pid-based teardown in `remove(force)` had nothing to signal.
+#[tokio::test]
+async fn force_remove_after_stop_leaves_no_sandbox_process_behind() {
+    let home = boxlite_test_utils::home::PerTestBoxHome::new();
+    let runtime = BoxliteRuntime::new(BoxliteOptions {
+        home_dir: home.path.clone(),
+        image_registries: common::test_registries(),
+    })
+    .expect("create runtime");
+
+    let handle = runtime.create(common::alpine_opts(), None).await.unwrap();
+    let id: BoxID = handle.id().clone();
+    handle.start().await.unwrap();
+    handle.stop().await.unwrap();
+
+    runtime.remove(id.as_str(), true).await.unwrap();
+
+    assert_eq!(
+        boxlite::jailer::box_processes(&id),
+        Vec::<u32>::new(),
+        "no host process of the box may outlive stop() + remove(force)"
+    );
+
+    let _ = runtime.shutdown(Some(common::TEST_SHUTDOWN_TIMEOUT)).await;
+}

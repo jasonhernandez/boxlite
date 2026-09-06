@@ -59,6 +59,7 @@ mod command;
 mod common;
 mod error;
 mod pre_exec;
+pub(crate) mod reaper;
 pub(crate) mod sandbox;
 pub(crate) mod shim_copy;
 
@@ -93,22 +94,48 @@ pub use sandbox::{
 // Teardown facade
 // ============================================================================
 
-/// Reap any OS processes still belonging to a box's sandbox (best-effort).
+/// Reap any OS processes still belonging to a box's sandbox.
 ///
 /// The semantic teardown entry for the isolation layer: callers name the
 /// *box*, not the mechanism, so nothing above the jailer has to know how a box
-/// is confined. On Linux the box's whole process tree lives in its cgroup, so
-/// this reaps it by id; on platforms with no host-side sandbox tree it is a
-/// no-op. Idempotent — safe on an already-stopped or never-started box.
-#[cfg(target_os = "linux")]
+/// is confined. Idempotent — safe on an already-stopped or never-started box.
+///
+/// Two legs, in order. On Linux the box's whole tree lives in its cgroup, so
+/// `cgroup.kill` ends it in one write; that is the fast path and the only one
+/// that cannot race a fork. It is also best-effort — it needs cgroup v2, a
+/// kernel with `cgroup.kill`, and, rootless, a delegated user subtree — and it
+/// fails *silently* when any of that is missing. So the second leg always
+/// runs: [`reaper::reap_box_processes`] signals whatever is still alive and
+/// reports what survived.
+///
+/// # Returns
+///
+/// `true` when the box owns no live process on this host. A caller may only
+/// report a stop or a removal as successful when this returned `true` —
+/// returning success over a live VM is what left operators reclaiming guest
+/// memory by hand.
 pub(crate) fn reap_box(box_id: &crate::runtime::id::BoxID) -> bool {
-    cgroup::kill_cgroup(box_id)
+    #[cfg(target_os = "linux")]
+    cgroup::kill_cgroup(box_id);
+
+    let survivors = reaper::reap_box_processes(box_id);
+    if !survivors.is_empty() {
+        tracing::error!(
+            box_id = %box_id,
+            pids = ?survivors,
+            "Box processes survived SIGKILL; guest memory is still held"
+        );
+        return false;
+    }
+    true
 }
 
-/// See the Linux variant. No host-side sandbox process tree to reap here.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn reap_box(_box_id: &crate::runtime::id::BoxID) -> bool {
-    false
+/// Live pids belonging to a box's sandbox, for diagnostics and tests.
+///
+/// The same attribution [`reap_box`] acts on: a box's processes carry its
+/// runtime directory in their command line.
+pub fn box_processes(box_id: &crate::runtime::id::BoxID) -> Vec<u32> {
+    reaper::box_processes(box_id)
 }
 
 // Volume specification (convenience re-export)

@@ -704,6 +704,7 @@ impl BoxImpl {
         // through the restart pipeline and spawn a new VM — exactly what
         // stop() must NOT do.
         let should_attach = self.state.read().status == BoxStatus::Running;
+        let mut torn_down = false;
         if should_attach && let Ok(live) = self.ensure_booted().await {
             // Recovered boxes lazy-attach here via vmm_attach (now
             // ProcessIdentity-gated). Live boxes hit the cached LiveState.
@@ -723,10 +724,21 @@ impl BoxImpl {
             // Stop handler
             if let Ok(mut handler) = live.handler.lock() {
                 handler.stop()?;
+                torn_down = true;
             }
         }
-        // If live_state() failed (vmm_attach said Absent — shim is gone),
-        // or status wasn't Running, fall through to cleanup.
+        // If status wasn't Running there is nothing to tear down and we fall
+        // through to cleanup. If it *was* Running but the attach or the
+        // handler lock failed, the VM may well still be alive: reap by box id
+        // rather than returning success over it. `reap_box` is idempotent, so
+        // the case where the shim really is gone costs one process scan.
+        if should_attach && !torn_down && !crate::jailer::reap_box(&self.config.id) {
+            return Err(BoxliteError::Internal(format!(
+                "box {} could not be attached and its sandbox processes \
+                 survived SIGKILL",
+                self.config.id
+            )));
+        }
 
         // Clean up PID file (single source of truth)
         let pid_path = self.layout.pid_file_path();
