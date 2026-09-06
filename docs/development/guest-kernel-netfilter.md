@@ -27,10 +27,17 @@ The fragment lives in *this* repo, not in the libkrunfw submodule, so the
 config is versioned with the code that depends on it and no submodule pointer
 has to move.
 
+> **The vendored `config-libkrunfw_x86_64` is generated, not source.** The
+> build script writes the merged result into the submodule's working tree, so
+> that file shows as modified after a from-source build and is deliberately
+> never committed. `netfilter.config` is the only source of truth: edit the
+> vendored config directly and your change is silently overwritten by the next
+> build. `git submodule update` discards it, which is fine — it is rebuilt.
+
 The guest kernel has no loadable-module support (`# CONFIG_MODULES is not
 set`), so every symbol is built in.
 
-## Building it
+## One symbol that is not netfilter
 
 `CONFIG_POSIX_MQUEUE` is in the fragment for a different reason: it is not a
 netfilter symbol, but runc's default OCI spec always mounts `mqueue` at
