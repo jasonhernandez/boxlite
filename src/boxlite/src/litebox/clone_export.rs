@@ -68,26 +68,70 @@ impl BoxImpl {
             )));
         }
 
-        // Phase A: Create shared base layer inside quiesce bracket (VM paused).
-        // This is the same operation as snapshot creation: rename + COW child.
+        // Phase A: Settle on the shared base inside the quiesce bracket (VM
+        // paused). Either the source's top layer becomes the base — same
+        // operation as snapshot creation, rename + COW child — or, when that top
+        // layer holds nothing, the base it already sits on is reused as-is.
+        //
+        // The choice has to happen with the VM paused: it turns on whether the
+        // top layer owns a cluster, and a guest write between the check and the
+        // fork would strand data in a layer we decided to look through.
         let source_box_id = self.id().to_string();
-        let layer = {
+        let (layer, promoted) = {
             let src_disks = src_disks.clone();
             let source_box_id = source_box_id.clone();
+            let rt = Arc::clone(&rt);
 
-            self.with_quiesce_async(async {
-                rt.base_disk_mgr.create_base_disk(
-                    &src_disks,
-                    BaseDiskKind::CloneBase,
-                    None,
-                    &source_box_id,
-                )
+            self.with_quiesce_async(async move {
+                match rt.base_disk_mgr.reusable_clone_base(&src_disks)? {
+                    Some(existing) => Ok((existing, false)),
+                    None => rt
+                        .base_disk_mgr
+                        .create_base_disk(&src_disks, BaseDiskKind::CloneBase, None, &source_box_id)
+                        .map(|layer| (layer, true)),
+                }
             })
             .await?
         };
 
         // base_path is a flat file (e.g., bases/{nanoid}.qcow2)
         let shared_container = layer.disk_info.to_path_buf();
+
+        // The source keeps its own (still empty) child of a reused base, so it
+        // already holds a ref — unless a crash lost the row. add_ref is
+        // idempotent; re-asserting it costs one INSERT OR IGNORE and keeps GC
+        // from collecting a base the source is sitting on.
+        if !promoted && let Err(e) = rt.base_disk_mgr.store().add_ref(&layer.id, &source_box_id) {
+            tracing::warn!(
+                source_id = %source_box_id,
+                base_disk_id = %layer.id,
+                error = %e,
+                "Failed to re-assert source base disk ref for reused clone base"
+            );
+        }
+
+        // Refuse before making N clones that cannot boot. The jailer grants
+        // exactly what `read_backing_chain` returns, so a chain past the walk
+        // limit loses its tail and libkrun fails virtio-blk setup with EINVAL —
+        // a boot-time error for a clone-time mistake.
+        let base_chain = crate::disk::read_backing_chain_checked(&shared_container);
+        // The clone's own chain is the shared base plus everything behind it.
+        let clone_chain_depth = base_chain.files.len() + 1;
+        if base_chain.truncated || clone_chain_depth > crate::disk::MAX_BACKING_CHAIN_DEPTH {
+            return Err(BoxliteError::Storage(format!(
+                "Refusing to clone {}: a clone would back onto {} whose chain is {} \
+                 layers deep, over the {}-layer limit, and could not be granted its \
+                 whole chain at boot. Flatten the chain first (qemu-img rebase).",
+                source_box_id,
+                shared_container.display(),
+                if base_chain.truncated {
+                    format!(">{}", crate::disk::MAX_BACKING_CHAIN_DEPTH)
+                } else {
+                    clone_chain_depth.to_string()
+                },
+                crate::disk::MAX_BACKING_CHAIN_DEPTH,
+            )));
+        }
 
         // Read virtual size from the shared base for overlay creation.
         let container_vsize = Qcow2Helper::qcow2_virtual_size(&shared_container)?;
@@ -163,6 +207,8 @@ impl BoxImpl {
             source_id = %self.id(),
             base_disk_id = %layer.id,
             count = clones.len(),
+            promoted_new_base = promoted,
+            chain_depth = clone_chain_depth,
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "Batch cloned boxes (shared base disk)"
         );

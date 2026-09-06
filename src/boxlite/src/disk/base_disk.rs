@@ -330,6 +330,53 @@ impl BaseDiskManager {
         Ok(disk)
     }
 
+    /// The base a clone can share *without* promoting a new layer, if any.
+    ///
+    /// [`Self::create_base_disk`] forks the source's live container disk into
+    /// `bases/` and re-children the source onto it. When the source has not
+    /// written a single cluster since its last fork, that promoted layer is
+    /// empty: it lengthens every chain that runs through it and carries no data.
+    /// Cloning an idle box in a loop therefore walks the chain past
+    /// [`crate::disk::MAX_BACKING_CHAIN_DEPTH`], after which the jailer's grant
+    /// list loses the terminal rootfs image and the box fails at boot with
+    /// libkrun EINVAL on virtio-blk — far from the clone that caused it.
+    ///
+    /// So when the top layer owns nothing, hand back the base it is already
+    /// sitting on: the clone becomes a sibling of the source under that base and
+    /// nobody's chain grows.
+    ///
+    /// `None` means "fork as usual". That covers three cases, all of which the
+    /// fork path handles correctly:
+    /// - the top layer holds data, so it is a real fork point;
+    /// - it backs onto a raw rootfs image rather than a qcow2 base, so there is
+    ///   no base disk to share;
+    /// - that backing file has no `base_disk` row. Refs are what
+    ///   [`Self::try_gc_base`] counts, and a base we cannot ref is a base GC
+    ///   could delete out from under the clone.
+    pub(crate) fn reusable_clone_base(
+        &self,
+        source_disks_dir: &Path,
+    ) -> BoxliteResult<Option<BaseDisk>> {
+        let container = source_disks_dir.join(disk_filenames::CONTAINER_DISK);
+
+        if super::qcow2_owns_clusters(&container)? {
+            return Ok(None);
+        }
+
+        let Some(backing) = super::read_backing_file_path(&container)? else {
+            return Ok(None);
+        };
+        let backing = PathBuf::from(backing);
+        if !backing.exists() || !super::qcow2::has_qcow2_magic(&backing)? {
+            return Ok(None);
+        }
+
+        Ok(self
+            .store
+            .find_by_base_path(&backing.to_string_lossy())?
+            .map(|record| record.disk))
+    }
+
     /// Attempt to garbage-collect a clone base by ID and cascade to parent.
     ///
     /// Queries the `base_disk_ref` table for dependents. If none exist,
@@ -982,6 +1029,164 @@ mod tests {
         assert!(
             fresh.exists(),
             "a file inside the grace window must survive"
+        );
+    }
+
+    // ========================================================================
+    // reusable_clone_base — do not promote an empty layer
+    // ========================================================================
+
+    /// A source disks dir holding a real, empty container disk.
+    fn source_disks(dir: &TempDir) -> PathBuf {
+        let disks = dir.path().join("src").join("disks");
+        std::fs::create_dir_all(&disks).unwrap();
+        let container = disks.join(disk_filenames::CONTAINER_DISK);
+        crate::disk::Qcow2Helper::create_disk(&container, true)
+            .unwrap()
+            .leak();
+        disks
+    }
+
+    /// Depth of the container disk's backing chain.
+    fn chain_depth(disks: &Path) -> usize {
+        super::super::read_backing_chain(&disks.join(disk_filenames::CONTAINER_DISK)).len()
+    }
+
+    /// After one fork the source sits on an empty child of the new base. A
+    /// second clone must reuse that base rather than promote the empty child.
+    #[test]
+    fn reusable_clone_base_reuses_an_empty_top_layer() {
+        let (dir, mgr) = setup();
+        let disks = source_disks(&dir);
+
+        let first = mgr
+            .create_base_disk(&disks, BaseDiskKind::CloneBase, None, "box1")
+            .unwrap();
+
+        let reusable = mgr.reusable_clone_base(&disks).unwrap();
+
+        assert_eq!(
+            reusable.map(|b| b.id.to_string()),
+            Some(first.id.to_string()),
+            "an untouched top layer must hand back the base it already sits on"
+        );
+    }
+
+    /// A top layer with data is a genuine fork point; promoting it is correct.
+    #[test]
+    fn reusable_clone_base_promotes_when_the_top_layer_has_data() {
+        let (dir, mgr) = setup();
+        let disks = source_disks(&dir);
+
+        mgr.create_base_disk(&disks, BaseDiskKind::CloneBase, None, "box1")
+            .unwrap();
+        crate::disk::qcow2::write_test_allocated_cluster(
+            &disks.join(disk_filenames::CONTAINER_DISK),
+        );
+
+        assert!(
+            mgr.reusable_clone_base(&disks).unwrap().is_none(),
+            "a dirty top layer must be promoted, not looked through"
+        );
+    }
+
+    /// The very first clone of a box has nothing to reuse: its container disk is
+    /// standalone (or backs a raw rootfs image), so the fork path owns that case.
+    #[test]
+    fn reusable_clone_base_promotes_a_standalone_disk() {
+        let (dir, mgr) = setup();
+        let disks = source_disks(&dir);
+
+        assert!(mgr.reusable_clone_base(&disks).unwrap().is_none());
+    }
+
+    /// A backing file we have no `base_disk` row for cannot be ref-counted, and
+    /// an unref'd base is one GC may delete under the clone. Promote instead.
+    #[test]
+    fn reusable_clone_base_promotes_when_the_backing_file_is_untracked() {
+        let (dir, mgr) = setup();
+        let disks = source_disks(&dir);
+
+        // Fork by hand — no DB row.
+        let orphan = mgr.bases_dir.join("untracked.qcow2");
+        super::super::fork_qcow2(&disks.join(disk_filenames::CONTAINER_DISK), &orphan).unwrap();
+
+        assert!(mgr.reusable_clone_base(&disks).unwrap().is_none());
+    }
+
+    /// The regression itself: cloning a box that never writes must not lengthen
+    /// anyone's chain. Five rounds of the clone path's base selection, one
+    /// promotion.
+    #[test]
+    fn repeated_clones_of_an_idle_box_keep_the_chain_depth_constant() {
+        let (dir, mgr) = setup();
+        let disks = source_disks(&dir);
+
+        let mut promotions = 0;
+        let mut depths = Vec::new();
+        for _ in 0..5 {
+            if mgr.reusable_clone_base(&disks).unwrap().is_none() {
+                mgr.create_base_disk(&disks, BaseDiskKind::CloneBase, None, "box1")
+                    .unwrap();
+                promotions += 1;
+            }
+            depths.push(chain_depth(&disks));
+        }
+
+        assert_eq!(
+            promotions, 1,
+            "only the first clone has anything to promote"
+        );
+        assert_eq!(
+            depths,
+            vec![1, 1, 1, 1, 1],
+            "an idle source must stay one link deep"
+        );
+    }
+
+    /// And the other branch stays intact: a source that writes between clones
+    /// gets a real fork point each time, so the chain grows by exactly one.
+    #[test]
+    fn clones_of_a_dirty_box_grow_the_chain_by_one_each_time() {
+        let (dir, mgr) = setup();
+        let disks = source_disks(&dir);
+        let container = disks.join(disk_filenames::CONTAINER_DISK);
+
+        let mut depths = Vec::new();
+        for _ in 0..4 {
+            crate::disk::qcow2::write_test_allocated_cluster(&container);
+            if mgr.reusable_clone_base(&disks).unwrap().is_none() {
+                mgr.create_base_disk(&disks, BaseDiskKind::CloneBase, None, "box1")
+                    .unwrap();
+            }
+            depths.push(chain_depth(&disks));
+        }
+
+        assert_eq!(depths, vec![1, 2, 3, 4]);
+    }
+
+    /// GC must still see the source as a dependent of a base it did not create
+    /// this round — the ref is what stops `try_gc_base` collecting it.
+    #[test]
+    fn a_reused_base_still_has_the_source_as_a_dependent() {
+        let (dir, mgr) = setup();
+        let disks = source_disks(&dir);
+
+        let base = mgr
+            .create_base_disk(&disks, BaseDiskKind::CloneBase, None, "box1")
+            .unwrap();
+        let reused = mgr.reusable_clone_base(&disks).unwrap().unwrap();
+        assert_eq!(reused.id.to_string(), base.id.to_string());
+
+        // The clone path re-asserts this ref; it is idempotent.
+        mgr.store.add_ref(&reused.id, "box1").unwrap();
+        mgr.store.add_ref(&reused.id, "clone1").unwrap();
+
+        assert!(mgr.store.has_dependents(&reused.id).unwrap());
+        mgr.try_gc_base(&reused.id);
+        assert!(
+            reused.disk_info.exists(),
+            "a base with dependents must survive GC"
         );
     }
 

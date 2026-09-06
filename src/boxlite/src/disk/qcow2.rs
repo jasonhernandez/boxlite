@@ -1063,18 +1063,48 @@ pub fn set_backing_file_path(qcow2_path: &Path, new_backing: &Path) -> BoxliteRe
 }
 
 /// Maximum depth for backing chain walks (prevents infinite loops from circular refs).
-const MAX_BACKING_CHAIN_DEPTH: usize = 8;
+///
+/// Every consumer of a backing chain is bounded by this: the GC's reachability
+/// sweep, and — the one that bites — the jailer's read grants. A chain longer
+/// than this walks off the end silently, and the ungranted tail is the terminal
+/// rootfs image, so the box dies at boot with `krun_start_enter failed
+/// status=-22` rather than at the operation that made the chain too long.
+/// [`read_backing_chain_checked`] exists so a caller can tell the difference.
+pub const MAX_BACKING_CHAIN_DEPTH: usize = 8;
+
+/// A backing-chain walk and whether it ran out of depth before the end.
+pub struct BackingChain {
+    /// Backing files from nearest to furthest. Never includes the start path.
+    pub files: Vec<PathBuf>,
+    /// The walk stopped at [`MAX_BACKING_CHAIN_DEPTH`] with more chain to go, so
+    /// `files` is a prefix, not the whole chain.
+    pub truncated: bool,
+}
 
 /// Walk a qcow2 backing chain, returning all backing file paths.
 ///
 /// Follows backing references from `path` until: no backing, file missing,
 /// read error, or depth limit. Returns partial results on error.
 /// Does NOT include `path` itself.
+///
+/// Callers that must not silently lose the tail want
+/// [`read_backing_chain_checked`] instead.
 pub fn read_backing_chain(path: &Path) -> Vec<PathBuf> {
-    let mut chain = Vec::new();
-    let mut current = path.to_path_buf();
+    read_backing_chain_checked(path).files
+}
 
-    for _ in 0..MAX_BACKING_CHAIN_DEPTH {
+/// [`read_backing_chain`], plus whether the depth limit cut the walk short.
+///
+/// Partial results from a read error are *not* flagged: `truncated` means
+/// specifically "there is more chain than [`MAX_BACKING_CHAIN_DEPTH`] allows",
+/// which is a condition the caller can act on (refuse the operation, tell the
+/// operator to flatten) rather than an environmental fault it cannot.
+pub fn read_backing_chain_checked(path: &Path) -> BackingChain {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut current = path.to_path_buf();
+    let mut truncated = false;
+
+    loop {
         match has_qcow2_magic(&current) {
             Ok(true) => {}
             Ok(false) => {
@@ -1100,7 +1130,17 @@ pub fn read_backing_chain(path: &Path) -> Vec<PathBuf> {
                 if !backing_path.exists() {
                     break;
                 }
-                chain.push(backing_path.clone());
+                if files.len() == MAX_BACKING_CHAIN_DEPTH {
+                    tracing::warn!(
+                        path = %path.display(),
+                        next = %backing_path.display(),
+                        max_depth = MAX_BACKING_CHAIN_DEPTH,
+                        "Backing chain is longer than the walk limit — truncating"
+                    );
+                    truncated = true;
+                    break;
+                }
+                files.push(backing_path.clone());
                 current = backing_path;
             }
             Ok(None) => break,
@@ -1115,14 +1155,115 @@ pub fn read_backing_chain(path: &Path) -> Vec<PathBuf> {
         }
     }
 
-    chain
+    BackingChain { files, truncated }
+}
+
+/// Does this qcow2 allocate any cluster of its own?
+///
+/// `false` means every read falls through to the backing file, so the layer
+/// contributes nothing but a link in the chain — [`crate::disk::BaseDiskManager`]
+/// uses this to decide whether a clone needs a new shared base at all.
+///
+/// A cluster counts as owned when its L2 entry is non-zero once the COPIED flag
+/// (bit 63, pure refcount bookkeeping) is masked off. That deliberately includes
+/// a compressed cluster and a *zero* cluster: a zero cluster written over data in
+/// the backing file is content this layer owns, and skipping past it would
+/// resurrect the data underneath.
+///
+/// Only the L2 tables the L1 says exist are read, so an untouched overlay costs
+/// one header read plus one L1 read.
+pub fn qcow2_owns_clusters(path: &Path) -> BoxliteResult<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    /// Bits 9..55 of an L1/L2 entry hold a cluster offset.
+    const OFFSET_MASK: u64 = 0x00FF_FFFF_FFFF_FE00;
+    /// Bit 63 — set when the cluster's refcount is exactly 1. Bookkeeping only.
+    const COPIED_FLAG: u64 = 1 << 63;
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| BoxliteError::Storage(format!("Failed to open {}: {}", path.display(), e)))?;
+
+    let mut hdr = [0u8; 104];
+    file.read_exact(&mut hdr).map_err(|e| {
+        BoxliteError::Storage(format!(
+            "Failed to read qcow2 header from {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let magic = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+    if magic != QCOW2_MAGIC {
+        return Err(BoxliteError::Storage(format!(
+            "Invalid qcow2 magic in {}: 0x{:08x}",
+            path.display(),
+            magic
+        )));
+    }
+
+    let cluster_bits = u32::from_be_bytes(hdr[20..24].try_into().unwrap());
+    // Guard the shift and the L2 buffer size: a corrupt header must not turn
+    // into a multi-gigabyte allocation here.
+    if !(9..=21).contains(&cluster_bits) {
+        return Err(BoxliteError::Storage(format!(
+            "Implausible cluster_bits {} in {}",
+            cluster_bits,
+            path.display()
+        )));
+    }
+    let cluster_size = 1u64 << cluster_bits;
+
+    let l1_size = u32::from_be_bytes(hdr[36..40].try_into().unwrap());
+    let l1_offset = u64::from_be_bytes(hdr[40..48].try_into().unwrap());
+    if l1_size == 0 || l1_offset == 0 {
+        return Ok(false);
+    }
+
+    file.seek(SeekFrom::Start(l1_offset)).map_err(|e| {
+        BoxliteError::Storage(format!("Failed to seek to L1 in {}: {}", path.display(), e))
+    })?;
+    let mut l1_buf = vec![0u8; (l1_size as usize) * 8];
+    file.read_exact(&mut l1_buf).map_err(|e| {
+        BoxliteError::Storage(format!(
+            "Failed to read L1 table from {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let mut l2_buf = vec![0u8; cluster_size as usize];
+    for entry in l1_buf.as_chunks::<8>().0 {
+        let l2_offset = u64::from_be_bytes(*entry) & OFFSET_MASK;
+        if l2_offset == 0 {
+            continue;
+        }
+
+        file.seek(SeekFrom::Start(l2_offset)).map_err(|e| {
+            BoxliteError::Storage(format!("Failed to seek to L2 in {}: {}", path.display(), e))
+        })?;
+        file.read_exact(&mut l2_buf).map_err(|e| {
+            BoxliteError::Storage(format!(
+                "Failed to read L2 table from {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        for l2_entry in l2_buf.as_chunks::<8>().0 {
+            if u64::from_be_bytes(*l2_entry) & !COPIED_FLAG != 0 {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Return true when `path` starts with the QCOW2 magic (`QFI\xfb`).
 ///
 /// Raw backing files are valid terminal nodes in a qcow2 backing chain, so a
 /// non-qcow2 magic is not an error here.
-fn has_qcow2_magic(path: &Path) -> BoxliteResult<bool> {
+pub(crate) fn has_qcow2_magic(path: &Path) -> BoxliteResult<bool> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| BoxliteError::Storage(format!("Failed to open {}: {}", path.display(), e)))?;
 
@@ -1393,6 +1534,53 @@ pub(crate) fn write_test_qcow2(path: &Path, backing_path: Option<&str>) {
     file.write_all(&buf).unwrap();
 }
 
+/// Test helper: give a real qcow2 one allocated cluster.
+///
+/// Writes the on-disk shape a guest write leaves behind — L1[0] pointing at a
+/// fresh L2 table, L2[0] at a fresh data cluster — without a VM. Refcount
+/// structures are deliberately not updated; nothing that reads this file in the
+/// tests consults them.
+#[cfg(test)]
+pub(crate) fn write_test_allocated_cluster(path: &Path) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    const COPIED_FLAG: u64 = 1 << 63;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+
+    let mut hdr = [0u8; 104];
+    file.read_exact(&mut hdr).unwrap();
+    let cluster_bits = u32::from_be_bytes(hdr[20..24].try_into().unwrap());
+    let l1_offset = u64::from_be_bytes(hdr[40..48].try_into().unwrap());
+    let cluster_size = 1u64 << cluster_bits;
+
+    // Append the two new clusters at the end of the file.
+    let len = file.metadata().unwrap().len();
+    let l2_offset = len.div_ceil(cluster_size) * cluster_size;
+    let data_offset = l2_offset + cluster_size;
+
+    file.seek(SeekFrom::Start(l2_offset)).unwrap();
+    file.write_all(&vec![0u8; cluster_size as usize]).unwrap();
+    file.write_all(&vec![0xABu8; cluster_size as usize])
+        .unwrap();
+
+    // L2[0] -> the data cluster.
+    file.seek(SeekFrom::Start(l2_offset)).unwrap();
+    file.write_all(&(data_offset | COPIED_FLAG).to_be_bytes())
+        .unwrap();
+
+    // L1[0] -> the L2 table.
+    file.seek(SeekFrom::Start(l1_offset)).unwrap();
+    file.write_all(&(l2_offset | COPIED_FLAG).to_be_bytes())
+        .unwrap();
+
+    file.sync_all().unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1422,6 +1610,98 @@ mod tests {
 
         let mut file = std::fs::File::create(path).unwrap();
         file.write_all(&buf).unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // qcow2_owns_clusters / read_backing_chain_checked
+    // ---------------------------------------------------------------------
+
+    /// A freshly created COW child allocates nothing — every read falls through
+    /// to its backing file. This is exactly the layer the clone path used to
+    /// promote into `bases/` on every clone of an idle box.
+    #[test]
+    fn owns_clusters_is_false_for_a_fresh_cow_child() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.qcow2");
+        Qcow2Helper::create_disk(&base, true).unwrap().leak();
+        let vsize = Qcow2Helper::qcow2_virtual_size(&base).unwrap();
+
+        let child = dir.path().join("child.qcow2");
+        Qcow2Helper::create_cow_child_disk(&base, BackingFormat::Qcow2, &child, vsize)
+            .unwrap()
+            .leak();
+
+        assert!(!qcow2_owns_clusters(&child).unwrap());
+    }
+
+    /// One allocated cluster is enough to make a layer a real fork point.
+    #[test]
+    fn owns_clusters_is_true_once_a_cluster_is_allocated() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.qcow2");
+        Qcow2Helper::create_disk(&base, true).unwrap().leak();
+        let vsize = Qcow2Helper::qcow2_virtual_size(&base).unwrap();
+
+        let child = dir.path().join("child.qcow2");
+        Qcow2Helper::create_cow_child_disk(&base, BackingFormat::Qcow2, &child, vsize)
+            .unwrap()
+            .leak();
+        assert!(!qcow2_owns_clusters(&child).unwrap());
+
+        super::write_test_allocated_cluster(&child);
+
+        assert!(qcow2_owns_clusters(&child).unwrap());
+    }
+
+    /// A base image with no backing file of its own still reports honestly.
+    #[test]
+    fn owns_clusters_handles_a_standalone_image() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.qcow2");
+        Qcow2Helper::create_disk(&base, true).unwrap().leak();
+
+        assert!(!qcow2_owns_clusters(&base).unwrap());
+        super::write_test_allocated_cluster(&base);
+        assert!(qcow2_owns_clusters(&base).unwrap());
+    }
+
+    /// Build `links` chained qcow2 files, newest first, and return the top.
+    fn build_chain(dir: &Path, links: usize) -> PathBuf {
+        let mut previous: Option<PathBuf> = None;
+        for i in 0..links {
+            let path = dir.join(format!("layer{i}.qcow2"));
+            write_qcow2_with_backing(&path, previous.as_ref().map(|p| p.to_str().unwrap()));
+            previous = Some(path);
+        }
+        previous.unwrap()
+    }
+
+    /// A chain that ends inside the limit is complete, and says so.
+    #[test]
+    fn read_backing_chain_checked_is_untruncated_at_the_limit() {
+        let dir = TempDir::new().unwrap();
+        // Top plus exactly MAX backing files.
+        let top = build_chain(dir.path(), MAX_BACKING_CHAIN_DEPTH + 1);
+
+        let chain = read_backing_chain_checked(&top);
+
+        assert_eq!(chain.files.len(), MAX_BACKING_CHAIN_DEPTH);
+        assert!(!chain.truncated);
+    }
+
+    /// One link further and the walk loses the tail — the condition that made a
+    /// cloned box fail at boot with libkrun EINVAL instead of at clone time.
+    #[test]
+    fn read_backing_chain_checked_flags_a_chain_past_the_limit() {
+        let dir = TempDir::new().unwrap();
+        let top = build_chain(dir.path(), MAX_BACKING_CHAIN_DEPTH + 2);
+
+        let chain = read_backing_chain_checked(&top);
+
+        assert_eq!(chain.files.len(), MAX_BACKING_CHAIN_DEPTH);
+        assert!(chain.truncated);
+        // The public wrapper keeps its old, silent contract.
+        assert_eq!(read_backing_chain(&top).len(), MAX_BACKING_CHAIN_DEPTH);
     }
 
     #[test]

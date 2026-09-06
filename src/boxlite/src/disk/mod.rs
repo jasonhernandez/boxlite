@@ -135,7 +135,8 @@ pub(crate) mod qcow2;
 pub(crate) use base_disk::{BaseDisk, BaseDiskKind, BaseDiskManager};
 pub use ext4::{create_ext4_from_dir, inject_file_into_ext4};
 pub use qcow2::{
-    BackingFormat, Qcow2Helper, is_backing_dependency, read_backing_chain, read_backing_file_path,
+    BackingFormat, MAX_BACKING_CHAIN_DEPTH, Qcow2Helper, is_backing_dependency,
+    qcow2_owns_clusters, read_backing_chain, read_backing_chain_checked, read_backing_file_path,
 };
 
 // ============================================================================

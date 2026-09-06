@@ -318,6 +318,29 @@ fn build_path_access(layout: &BoxFilesystemLayout, volumes: &[VolumeSpec]) -> Ve
         });
     }
 
+    // images/disk-images: the terminal rootfs ext4 every qcow2 chain bottoms out
+    // in. The chain walk above already grants it — until the chain is longer than
+    // MAX_BACKING_CHAIN_DEPTH, at which point the walk truncates and the file it
+    // drops is *always* this one, because bases/ is granted wholesale just above
+    // and everything else in a chain lives there. Losing it is not a subtle
+    // degradation: libkrun fails virtio-blk setup with EINVAL and the box never
+    // boots. Grant the directory outright, on the same footing and for the same
+    // reason as bases/ — disk images are data read by the hypervisor, never
+    // executed on the host — so a deep chain can no longer cost a box its rootfs.
+    if let Some(disk_images_dir) = layout
+        .root()
+        .parent()
+        .and_then(|boxes| boxes.parent())
+        .map(|home| home.join("images").join("disk-images"))
+        .filter(|p| p.exists())
+    {
+        let disk_images_dir = disk_images_dir.canonicalize().unwrap_or(disk_images_dir);
+        paths.push(PathAccess {
+            path: disk_images_dir,
+            writable: false,
+        });
+    }
+
     // The in-shim network backend may validate upstream TLS certificates
     // (for example secret-substitution MITM forwarding). Keep host trust
     // stores readable inside the sandbox without granting broader /etc access.
