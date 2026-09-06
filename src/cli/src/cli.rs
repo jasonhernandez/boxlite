@@ -994,10 +994,23 @@ pub struct CapabilityFlags {
     /// Drop a Linux capability from the container (repeatable; `ALL` is supported)
     #[arg(long = "cap-drop", value_name = "CAPABILITY")]
     pub cap_drop: Vec<String>,
+
+    /// Give the container every capability and drop the OCI read-only path
+    /// set, mirroring `docker run --privileged`. Off by default. Needed to
+    /// run a nested container engine (dockerd writes
+    /// `/proc/sys/net/ipv4/ip_forward` and `/sys/fs/cgroup`, both read-only
+    /// otherwise). This weakens the container boundary inside the VM; the
+    /// microVM boundary is unaffected. Cannot be combined with
+    /// `--cap-add`/`--cap-drop`.
+    #[arg(long = "privileged")]
+    pub privileged: bool,
 }
 
 impl CapabilityFlags {
     pub fn apply_to(&self, opts: &mut BoxOptions) {
+        if self.privileged {
+            opts.advanced.set_privileged(true);
+        }
         if self.cap_add.is_empty() && self.cap_drop.is_empty() {
             return;
         }
