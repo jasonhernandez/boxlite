@@ -359,7 +359,7 @@ impl BoxBackend for RestBox {
 
         let box_id = self.box_id_str();
         let path = format!("/boxes/{}/clone", box_id);
-        let req = CloneBoxRequest::from_options(&options, name.as_deref());
+        let req = CloneBoxRequest::from_options(&options, name.as_deref())?;
         let resp: BoxResponse = self.client.post(&path, &req).await?;
 
         let info = resp.to_box_info()?;

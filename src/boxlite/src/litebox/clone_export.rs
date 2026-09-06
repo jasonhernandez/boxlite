@@ -38,7 +38,7 @@ impl BoxImpl {
     ///   C. Provision each clone and increment layer ref count.
     pub(crate) async fn clone_boxes(
         &self,
-        _options: crate::runtime::options::CloneOptions,
+        options: crate::runtime::options::CloneOptions,
         count: usize,
         names: Vec<String>,
     ) -> BoxliteResult<Vec<crate::LiteBox>> {
@@ -53,6 +53,13 @@ impl BoxImpl {
                 count
             )));
         }
+
+        // Each clone is provisioned with the source box's options plus this
+        // clone's overrides. Validate up front, before the quiesce bracket and
+        // any disk work, so a rejected override costs nothing and leaves no
+        // half-made box behind.
+        let mut clone_options = self.config.options.clone();
+        options.apply_to(&mut clone_options)?;
 
         let t0 = Instant::now();
         let _lock = self.disk_ops.lock().await;
@@ -128,7 +135,7 @@ impl BoxImpl {
                 .provision_box(
                     staging.clone(),
                     names.get(i).cloned(),
-                    self.config.options.clone(),
+                    clone_options.clone(),
                     BoxStatus::Stopped,
                 )
                 .await

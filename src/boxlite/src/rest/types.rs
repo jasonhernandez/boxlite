@@ -517,10 +517,30 @@ pub(crate) struct CloneBoxRequest {
 }
 
 impl CloneBoxRequest {
-    pub fn from_options(_options: &CloneOptions, name: Option<&str>) -> Self {
-        Self {
-            name: name.map(|s| s.to_string()),
+    /// Build the wire request for a remote clone.
+    ///
+    /// The clone endpoint does not yet carry [`CloneOptions`] across the wire,
+    /// so any override would be dropped here and the remote clone would come
+    /// back holding the *source* box's secret values while the caller believed
+    /// it held theirs. Refuse instead: a loud error beats a box that
+    /// authenticates as someone else. Wiring `secrets` through the REST
+    /// request, the `serve` handler and the OpenAPI schema is the follow-up
+    /// that lifts this.
+    pub fn from_options(
+        options: &CloneOptions,
+        name: Option<&str>,
+    ) -> boxlite_shared::errors::BoxliteResult<Self> {
+        if options.secrets.is_some() {
+            return Err(BoxliteError::Unsupported(
+                "CloneOptions.secrets is not supported over the REST backend yet — the \
+                 clone would silently inherit the source box's secret values. Clone \
+                 against a local runtime, or create a new box with the secrets you want."
+                    .to_string(),
+            ));
         }
+        Ok(Self {
+            name: name.map(|s| s.to_string()),
+        })
     }
 }
 
@@ -720,6 +740,41 @@ mod tests {
         // None fields should be skipped
         assert!(!json.contains("rootfs_path"));
         assert!(!json.contains("disk_size_gb"));
+    }
+
+    #[test]
+    fn clone_box_request_inherits_when_no_secrets_are_given() {
+        let req = CloneBoxRequest::from_options(&CloneOptions::default(), Some("c1")).unwrap();
+        assert_eq!(req.name.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn clone_box_request_refuses_to_drop_per_clone_secrets() {
+        // The clone endpoint does not carry CloneOptions across the wire yet.
+        // Dropping the override silently would hand the caller a box holding
+        // the *source* box's credentials, so this must be an error until the
+        // REST/OpenAPI surfaces catch up.
+        use crate::runtime::options::Secret;
+
+        let options = CloneOptions {
+            secrets: Some(vec![Secret {
+                name: "gh".into(),
+                hosts: vec!["api.github.com".into()],
+                placeholder: "<BOXLITE_SECRET:gh>".into(),
+                value: "fake-token-123".into(),
+            }]),
+        };
+        let err = CloneBoxRequest::from_options(&options, Some("c1")).unwrap_err();
+        assert!(
+            matches!(err, BoxliteError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("CloneOptions.secrets"), "{msg}");
+        assert!(
+            !msg.contains("fake-token-123"),
+            "error must not echo a value"
+        );
     }
 
     #[test]

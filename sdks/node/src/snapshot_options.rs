@@ -26,13 +26,17 @@ impl From<JsExportOptions> for ExportOptions {
 }
 
 /// Options for cloning a box (forward-compatible placeholder).
+///
+/// The core `CloneOptions` now carries per-clone secret values; surfacing that
+/// on the Node side means adding the field here and to `JsCloneOptions` in
+/// `lib/native-contracts.ts`, and is left as a follow-up.
 #[napi(object)]
 #[derive(Clone, Debug)]
 pub struct JsCloneOptions {}
 
 impl From<JsCloneOptions> for CloneOptions {
     fn from(_js: JsCloneOptions) -> Self {
-        CloneOptions {}
+        CloneOptions::default()
     }
 }
 

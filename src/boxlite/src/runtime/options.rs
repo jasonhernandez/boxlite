@@ -1120,9 +1120,165 @@ pub struct SnapshotOptions {}
 #[derive(Debug, Clone, Default)]
 pub struct ExportOptions {}
 
-/// Forward-compatible options for cloning a box.
+/// Options for cloning a box.
+///
+/// # Why this carries `secrets`, and only its values
+///
+/// A clone is provisioned [`crate::runtime::types::BoxStatus::Stopped`], so its
+/// first `start()` takes the `reuse_rootfs` path and opens the COW disk the
+/// source box was built with — including the container image config the source
+/// baked. The `BOXLITE_SECRET_*` placeholder env vars the guest sees are
+/// injected when that rootfs is first built, so on a clone they are the
+/// *source's* and cannot be changed from here. The MITM proxy's substitution
+/// table, by contrast, is rebuilt from the box's persisted options at every
+/// start.
+///
+/// That asymmetry is what makes a value-only secret override safe and anything
+/// wider unsafe. Replacing [`Secret::value`] leaves the guest emitting the same
+/// placeholder to the same hosts while the proxy substitutes a different
+/// credential — a pure substitution-table change. Introducing a secret name the
+/// source does not have, dropping one it does, or moving a name to different
+/// `hosts` or a different `placeholder` would leave the proxy holding a table
+/// keyed on placeholders the guest never emits: the clone would look configured
+/// and would silently authenticate as nobody. [`CloneOptions::apply_to`]
+/// rejects those cases rather than producing that box.
+///
+/// `env` is deliberately absent for the same reason: it is baked into the
+/// reused container image config, so a plumbing-only `env` override would be
+/// accepted here and then silently ignored by the guest. Offering it means
+/// first moving container env resolution off the baked image config, which is a
+/// change to the init pipeline rather than to this struct. `network` has no
+/// such obstacle — it is consumed at start — but is out of scope here.
 #[derive(Debug, Clone, Default)]
-pub struct CloneOptions {}
+pub struct CloneOptions {
+    /// New **values** for the source box's secrets.
+    ///
+    /// `None` (the default) inherits the source box's secrets unchanged. When
+    /// `Some`, the list must name exactly the source box's secrets, each with
+    /// the same `hosts` and the same `placeholder`; only `value` may differ.
+    /// Anything else is an error — see the type-level docs for why.
+    pub secrets: Option<Vec<Secret>>,
+}
+
+impl CloneOptions {
+    /// Overlay this clone's overrides onto a copy of the source box's options.
+    ///
+    /// Validation happens before any mutation: on error `opts` is untouched.
+    pub(crate) fn apply_to(&self, opts: &mut BoxOptions) -> BoxliteResult<()> {
+        let Some(overrides) = self.secrets.as_deref() else {
+            return Ok(());
+        };
+
+        let mut by_name: std::collections::BTreeMap<&str, &Secret> =
+            std::collections::BTreeMap::new();
+        for secret in overrides {
+            if by_name.insert(secret.name.as_str(), secret).is_some() {
+                return Err(boxlite_shared::errors::BoxliteError::InvalidArgument(
+                    format!(
+                        "clone secrets: secret name {:?} is listed twice; each of the \
+                         source box's secrets must appear exactly once",
+                        secret.name
+                    ),
+                ));
+            }
+        }
+
+        let source: std::collections::BTreeMap<&str, &Secret> =
+            opts.secrets.iter().map(|s| (s.name.as_str(), s)).collect();
+
+        let added: Vec<&str> = by_name
+            .keys()
+            .copied()
+            .filter(|name| !source.contains_key(name))
+            .collect();
+        if !added.is_empty() {
+            return Err(boxlite_shared::errors::BoxliteError::InvalidArgument(
+                format!(
+                    "clone secrets must name exactly the source box's secrets: {} not \
+                     present on the source box (source secrets: {}). A clone reuses the \
+                     source box's container image config, so its guest keeps the source's \
+                     BOXLITE_SECRET_* placeholders and a new secret name would never reach \
+                     it. Create a new box instead.",
+                    fmt_secret_names(added.iter().copied()),
+                    fmt_secret_names(source.keys().copied()),
+                ),
+            ));
+        }
+
+        let missing: Vec<&str> = source
+            .keys()
+            .copied()
+            .filter(|name| !by_name.contains_key(name))
+            .collect();
+        if !missing.is_empty() {
+            return Err(boxlite_shared::errors::BoxliteError::InvalidArgument(
+                format!(
+                    "clone secrets must name exactly the source box's secrets: {} missing \
+                     from the clone's secrets (source secrets: {}). Pass every source \
+                     secret — the values may differ — or pass no secrets at all to inherit \
+                     the source box's unchanged.",
+                    fmt_secret_names(missing.iter().copied()),
+                    fmt_secret_names(source.keys().copied()),
+                ),
+            ));
+        }
+
+        for (name, replacement) in &by_name {
+            let original = source[name];
+            if !host_lists_match(&original.hosts, &replacement.hosts) {
+                return Err(boxlite_shared::errors::BoxliteError::InvalidArgument(
+                    format!(
+                        "clone secret {:?}: hosts must match the source box's {:?}, got \
+                         {:?}. Host binding is the security boundary for placeholder \
+                         substitution and cannot be changed by a clone; only the value may \
+                         differ.",
+                        name, original.hosts, replacement.hosts
+                    ),
+                ));
+            }
+            if original.placeholder != replacement.placeholder {
+                return Err(boxlite_shared::errors::BoxliteError::InvalidArgument(
+                    format!(
+                        "clone secret {:?}: placeholder must match the source box's {:?}, \
+                         got {:?}. The clone's guest keeps the source box's baked \
+                         placeholder env, so a changed placeholder would never appear in a \
+                         request and the value would never be substituted.",
+                        name, original.placeholder, replacement.placeholder
+                    ),
+                ));
+            }
+        }
+
+        opts.secrets = overrides.to_vec();
+        Ok(())
+    }
+}
+
+/// Render a set of secret names for an error message: sorted, quoted, comma-joined.
+fn fmt_secret_names<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let mut names: Vec<&str> = names.into_iter().collect();
+    names.sort_unstable();
+    names
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Two host lists match when they carry the same hosts, in any order.
+///
+/// Order is not meaningful to the proxy's host matcher, so requiring the caller
+/// to reproduce it would reject correct input.
+fn host_lists_match(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<&str> = a.iter().map(String::as_str).collect();
+    let mut b: Vec<&str> = b.iter().map(String::as_str).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
+}
 
 #[cfg(test)]
 mod tests {
@@ -2216,6 +2372,230 @@ mod tests {
             placeholder: "<BOXLITE_SECRET:openai>".to_string(),
             value: "sk-test-super-secret-key-12345".to_string(),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // CloneOptions::apply_to — per-clone secret values
+    //
+    // A clone is provisioned Stopped and so reuses the source box's container
+    // image config, including the baked BOXLITE_SECRET_* placeholder env. Only
+    // the proxy's substitution table is rebuilt per start, so a clone may
+    // replace secret *values* and nothing else. These pin that boundary.
+    // ------------------------------------------------------------------
+
+    fn clone_secret(name: &str, value: &str, hosts: &[&str]) -> Secret {
+        Secret {
+            name: name.to_string(),
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            placeholder: format!("<BOXLITE_SECRET:{name}>"),
+            value: value.to_string(),
+        }
+    }
+
+    fn source_options() -> BoxOptions {
+        BoxOptions {
+            secrets: vec![
+                clone_secret("gh", "source-gh", &["api.github.com"]),
+                clone_secret("openai", "source-openai", &["api.openai.com"]),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Every rejection here is a caller mistake, so it must reach a REST client
+    /// as a 400 rather than a 500 (same requirement as POL-356 above).
+    fn assert_invalid_argument(err: &boxlite_shared::errors::BoxliteError) {
+        assert!(
+            matches!(
+                err,
+                boxlite_shared::errors::BoxliteError::InvalidArgument(_)
+            ),
+            "expected InvalidArgument (→ HTTP 400), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn clone_secrets_none_inherits_the_source_box_unchanged() {
+        let mut opts = source_options();
+        CloneOptions::default().apply_to(&mut opts).unwrap();
+        assert_eq!(opts.secrets, source_options().secrets);
+    }
+
+    #[test]
+    fn clone_secrets_empty_list_is_not_the_same_as_none() {
+        // An empty list names none of the source's secrets, which is the
+        // "missing name" case — not a silent inherit.
+        let mut opts = source_options();
+        let err = CloneOptions {
+            secrets: Some(Vec::new()),
+        }
+        .apply_to(&mut opts)
+        .unwrap_err();
+        assert_invalid_argument(&err);
+        assert!(err.to_string().contains("missing from the clone's secrets"));
+        assert_eq!(
+            opts.secrets,
+            source_options().secrets,
+            "a rejected override must not mutate the options"
+        );
+    }
+
+    #[test]
+    fn clone_secrets_replace_values_when_names_and_hosts_match() {
+        let mut opts = source_options();
+        CloneOptions {
+            secrets: Some(vec![
+                clone_secret("openai", "clone-openai", &["api.openai.com"]),
+                clone_secret("gh", "clone-gh", &["api.github.com"]),
+            ]),
+        }
+        .apply_to(&mut opts)
+        .unwrap();
+
+        let by_name: std::collections::BTreeMap<&str, &Secret> =
+            opts.secrets.iter().map(|s| (s.name.as_str(), s)).collect();
+        assert_eq!(by_name["gh"].value, "clone-gh");
+        assert_eq!(by_name["openai"].value, "clone-openai");
+        // Names, hosts and placeholders are exactly the source box's, so the
+        // guest's baked env still matches the proxy's table.
+        assert_eq!(by_name["gh"].hosts, vec!["api.github.com".to_string()]);
+        assert_eq!(by_name["gh"].placeholder, "<BOXLITE_SECRET:gh>");
+        assert_eq!(opts.secrets.len(), 2);
+    }
+
+    #[test]
+    fn clone_secrets_accept_hosts_in_a_different_order() {
+        let mut opts = BoxOptions {
+            secrets: vec![clone_secret(
+                "gh",
+                "source",
+                &["api.github.com", "github.com"],
+            )],
+            ..Default::default()
+        };
+        CloneOptions {
+            secrets: Some(vec![clone_secret(
+                "gh",
+                "clone",
+                &["github.com", "api.github.com"],
+            )]),
+        }
+        .apply_to(&mut opts)
+        .unwrap();
+        assert_eq!(opts.secrets[0].value, "clone");
+    }
+
+    #[test]
+    fn clone_secrets_reject_a_name_the_source_box_does_not_have() {
+        let mut opts = source_options();
+        let err = CloneOptions {
+            secrets: Some(vec![
+                clone_secret("gh", "clone-gh", &["api.github.com"]),
+                clone_secret("openai", "clone-openai", &["api.openai.com"]),
+                clone_secret("linear", "clone-linear", &["api.linear.app"]),
+            ]),
+        }
+        .apply_to(&mut opts)
+        .unwrap_err();
+        assert_invalid_argument(&err);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"linear\" not present on the source box"),
+            "{msg}"
+        );
+        assert_eq!(opts.secrets, source_options().secrets);
+    }
+
+    #[test]
+    fn clone_secrets_reject_omitting_a_name_the_source_box_has() {
+        let mut opts = source_options();
+        let err = CloneOptions {
+            secrets: Some(vec![clone_secret("gh", "clone-gh", &["api.github.com"])]),
+        }
+        .apply_to(&mut opts)
+        .unwrap_err();
+        assert_invalid_argument(&err);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"openai\" missing from the clone's secrets"),
+            "{msg}"
+        );
+        assert_eq!(opts.secrets, source_options().secrets);
+    }
+
+    #[test]
+    fn clone_secrets_reject_changed_hosts() {
+        let mut opts = source_options();
+        let err = CloneOptions {
+            secrets: Some(vec![
+                clone_secret("gh", "clone-gh", &["evil.example.com"]),
+                clone_secret("openai", "clone-openai", &["api.openai.com"]),
+            ]),
+        }
+        .apply_to(&mut opts)
+        .unwrap_err();
+        assert_invalid_argument(&err);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("clone secret \"gh\": hosts must match"),
+            "{msg}"
+        );
+        assert!(msg.contains("evil.example.com"), "{msg}");
+        assert_eq!(opts.secrets, source_options().secrets);
+    }
+
+    #[test]
+    fn clone_secrets_reject_a_changed_placeholder() {
+        let mut opts = source_options();
+        let mut replacement = clone_secret("gh", "clone-gh", &["api.github.com"]);
+        replacement.placeholder = "<SOMETHING_ELSE>".to_string();
+        let err = CloneOptions {
+            secrets: Some(vec![
+                replacement,
+                clone_secret("openai", "clone-openai", &["api.openai.com"]),
+            ]),
+        }
+        .apply_to(&mut opts)
+        .unwrap_err();
+        assert_invalid_argument(&err);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("clone secret \"gh\": placeholder must match"),
+            "{msg}"
+        );
+        assert_eq!(opts.secrets, source_options().secrets);
+    }
+
+    #[test]
+    fn clone_secrets_reject_a_duplicated_name() {
+        let mut opts = source_options();
+        let err = CloneOptions {
+            secrets: Some(vec![
+                clone_secret("gh", "one", &["api.github.com"]),
+                clone_secret("gh", "two", &["api.github.com"]),
+                clone_secret("openai", "clone-openai", &["api.openai.com"]),
+            ]),
+        }
+        .apply_to(&mut opts)
+        .unwrap_err();
+        assert_invalid_argument(&err);
+        assert!(err.to_string().contains("is listed twice"));
+        assert_eq!(opts.secrets, source_options().secrets);
+    }
+
+    #[test]
+    fn clone_secrets_on_a_source_box_with_no_secrets_reject_anything_but_none() {
+        let mut opts = BoxOptions::default();
+        CloneOptions::default().apply_to(&mut opts).unwrap();
+        assert!(opts.secrets.is_empty());
+
+        let err = CloneOptions {
+            secrets: Some(vec![clone_secret("gh", "clone-gh", &["api.github.com"])]),
+        }
+        .apply_to(&mut opts)
+        .unwrap_err();
+        assert_invalid_argument(&err);
+        assert!(err.to_string().contains("not present on the source box"));
     }
 
     #[test]

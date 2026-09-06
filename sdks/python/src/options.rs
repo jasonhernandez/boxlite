@@ -527,6 +527,22 @@ impl PySecret {
     }
 }
 
+impl PySecret {
+    /// Convert into the core [`boxlite::runtime::options::Secret`], filling in
+    /// the default `<BOXLITE_SECRET:{name}>` placeholder when none was given.
+    pub(crate) fn into_core(self) -> boxlite::runtime::options::Secret {
+        let placeholder = self
+            .placeholder
+            .unwrap_or_else(|| format!("<BOXLITE_SECRET:{}>", self.name));
+        boxlite::runtime::options::Secret {
+            name: self.name,
+            hosts: self.hosts,
+            placeholder,
+            value: self.value,
+        }
+    }
+}
+
 // ============================================================================
 // Box Options
 // ============================================================================
@@ -757,14 +773,7 @@ impl TryFrom<PyBoxOptions> for BoxOptions {
         opts.secrets = py_opts
             .secrets
             .into_iter()
-            .map(|s| boxlite::runtime::options::Secret {
-                name: s.name.clone(),
-                hosts: s.hosts,
-                placeholder: s
-                    .placeholder
-                    .unwrap_or_else(|| format!("<BOXLITE_SECRET:{}>", s.name)),
-                value: s.value,
-            })
+            .map(PySecret::into_core)
             .collect();
 
         Ok(opts)
