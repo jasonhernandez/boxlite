@@ -190,4 +190,39 @@ mod tests {
         assert_eq!(capabilities.add, vec!["SYS_ADMIN"]);
         assert_eq!(capabilities.drop, vec!["CAP_NET_RAW"]);
     }
+
+    #[test]
+    fn create_defaults_to_unprivileged() {
+        let cli = Cli::try_parse_from(["boxlite", "create", "alpine"]).expect("should parse");
+        let Commands::Create(args) = cli.command else {
+            panic!("expected create command");
+        };
+
+        let opts = args
+            .to_box_options(&cli.global)
+            .expect("options should build");
+        assert!(
+            !opts.advanced.privileged,
+            "privileged must stay off unless asked for"
+        );
+    }
+
+    #[test]
+    fn create_privileged_flag_reaches_box_options() {
+        let cli = Cli::try_parse_from(["boxlite", "create", "--privileged", "alpine"])
+            .expect("privileged flag should parse");
+        let Commands::Create(args) = cli.command else {
+            panic!("expected create command");
+        };
+
+        let opts = args
+            .to_box_options(&cli.global)
+            .expect("options should build");
+        assert!(opts.advanced.privileged);
+        assert!(
+            opts.advanced.capabilities().is_none(),
+            "privileged must leave the capability policy unspecified so the \
+             one-flag DinD case stays distinguishable from an explicit override"
+        );
+    }
 }

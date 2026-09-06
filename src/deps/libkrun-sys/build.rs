@@ -938,6 +938,130 @@ fn build() {
     }
 }
 
+// ── Guest kernel config fragment ─────────────────────────────────────────────
+
+/// Kconfig fragment merged into the vendored libkrunfw config before a
+/// from-source build. Stock libkrunfw ships `# CONFIG_NETFILTER is not set`,
+/// which leaves the guest with no iptables/nftables backend.
+#[cfg(target_os = "linux")]
+const KERNEL_CONFIG_FRAGMENT: &str = "kernel-config/netfilter.config";
+
+/// Guest arch suffix libkrunfw's Makefile uses to pick a config file.
+#[cfg(target_os = "linux")]
+fn libkrunfw_config_arch() -> &'static str {
+    match env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => panic!("no libkrunfw kernel config for arch {other}"),
+    }
+}
+
+/// Symbol names a fragment assigns, in file order.
+#[cfg(target_os = "linux")]
+fn fragment_symbols(fragment: &str) -> Vec<String> {
+    fragment
+        .lines()
+        .filter_map(|line| line.strip_prefix("CONFIG_"))
+        .filter_map(|rest| rest.split_once('='))
+        .map(|(name, _)| format!("CONFIG_{name}"))
+        .collect()
+}
+
+/// Merge the fragment into `config-libkrunfw_<arch>`, in place and idempotently:
+/// every line the fragment assigns is dropped from the base first (in either
+/// `CONFIG_X=…` or `# CONFIG_X is not set` form), then the fragment is appended.
+///
+/// Written into the submodule checkout rather than a copy because libkrunfw's
+/// Makefile caches the unpacked kernel tree next to it; copying the tree
+/// elsewhere would re-download and re-extract the 145 MB tarball every build.
+#[cfg(target_os = "linux")]
+fn merge_kernel_config_fragment(manifest_dir: &Path, libkrunfw_src: &Path) {
+    let fragment_path = manifest_dir.join(KERNEL_CONFIG_FRAGMENT);
+    let fragment = fs::read_to_string(&fragment_path)
+        .unwrap_or_else(|e| panic!("read {}: {}", fragment_path.display(), e));
+    let config_path = libkrunfw_src.join(format!("config-libkrunfw_{}", libkrunfw_config_arch()));
+    let base = fs::read_to_string(&config_path)
+        .unwrap_or_else(|e| panic!("read {}: {}", config_path.display(), e));
+
+    let symbols = fragment_symbols(&fragment);
+    let drop_line = |line: &str| {
+        symbols.iter().any(|sym| {
+            line.strip_prefix(sym).is_some_and(|r| r.starts_with('='))
+                || line == format!("# {sym} is not set")
+        })
+    };
+
+    let mut merged: String = base
+        .lines()
+        .filter(|line| !drop_line(line))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    merged.push_str("\n# --- merged from libkrun-sys/");
+    merged.push_str(KERNEL_CONFIG_FRAGMENT);
+    merged.push_str(" ---\n");
+    for line in fragment.lines().filter(|l| l.starts_with("CONFIG_")) {
+        merged.push_str(line);
+        merged.push('\n');
+    }
+
+    if merged == base {
+        return;
+    }
+    fs::write(&config_path, merged)
+        .unwrap_or_else(|e| panic!("write {}: {}", config_path.display(), e));
+    println!(
+        "cargo:warning=Merged {} ({} symbols) into {}",
+        KERNEL_CONFIG_FRAGMENT,
+        symbols.len(),
+        config_path.display()
+    );
+}
+
+/// Fail the build if the kernel that was just built dropped a fragment symbol.
+///
+/// libkrunfw's Makefile copies the config into the unpacked kernel tree only
+/// when it first creates that tree, so a tree left over from an earlier build
+/// silently ignores a fragment edit. Checking the tree's own `.config` turns
+/// that into a build failure naming the fix instead of a kernel that boots
+/// without netfilter.
+#[cfg(target_os = "linux")]
+fn verify_kernel_config_fragment(manifest_dir: &Path, libkrunfw_src: &Path) {
+    let fragment_path = manifest_dir.join(KERNEL_CONFIG_FRAGMENT);
+    let fragment = fs::read_to_string(&fragment_path)
+        .unwrap_or_else(|e| panic!("read {}: {}", fragment_path.display(), e));
+
+    let Some(built) = fs::read_dir(libkrunfw_src).ok().and_then(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .map(|e| e.path().join(".config"))
+            .find(|p| p.is_file())
+    }) else {
+        panic!(
+            "no unpacked kernel tree with a .config under {}",
+            libkrunfw_src.display()
+        );
+    };
+    let config =
+        fs::read_to_string(&built).unwrap_or_else(|e| panic!("read {}: {}", built.display(), e));
+
+    let missing: Vec<String> = fragment_symbols(&fragment)
+        .into_iter()
+        .filter(|sym| !config.lines().any(|line| line == format!("{sym}=y")))
+        .collect();
+    if !missing.is_empty() {
+        panic!(
+            "guest kernel built without {} symbol(s) from {}: {}. \
+             Run `make clean` in {} and rebuild — libkrunfw only copies the \
+             config when it first unpacks the kernel tree.",
+            missing.len(),
+            KERNEL_CONFIG_FRAGMENT,
+            missing.join(", "),
+            libkrunfw_src.display()
+        );
+    }
+    println!("cargo:warning=Guest kernel carries all netfilter.config symbols");
+}
+
 /// Linux: Build libkrunfw and/or libkrun based on enabled features.
 ///
 /// - `krunfw`: Download pre-compiled .so (fast) or build from source
@@ -963,6 +1087,7 @@ fn build() {
         verify_vendored_sources(&manifest_dir, true);
 
         let libkrunfw_src = manifest_dir.join("vendor/libkrunfw");
+        merge_kernel_config_fragment(&manifest_dir, &libkrunfw_src);
         build_with_make(
             &libkrunfw_src,
             &libkrunfw_install,
@@ -970,6 +1095,7 @@ fn build() {
             &HashMap::new(),
             &[],
         );
+        verify_kernel_config_fragment(&manifest_dir, &libkrunfw_src);
     } else {
         println!("cargo:warning=Downloading pre-compiled libkrunfw...");
         download_libkrunfw_so(&libkrunfw_install);
@@ -1013,7 +1139,9 @@ fn main() {
     // Rebuild if vendored sources change
     println!("cargo:rerun-if-changed=vendor/libkrun");
     println!("cargo:rerun-if-changed=vendor/libkrunfw");
+    println!("cargo:rerun-if-changed=kernel-config");
     println!("cargo:rerun-if-env-changed=BOXLITE_DEPS_STUB");
+    println!("cargo:rerun-if-env-changed=BOXLITE_BUILD_LIBKRUNFW");
     #[cfg(target_os = "macos")]
     println!("cargo:rerun-if-env-changed=BOXLITE_LIBKRUN_CC_LINUX");
 
