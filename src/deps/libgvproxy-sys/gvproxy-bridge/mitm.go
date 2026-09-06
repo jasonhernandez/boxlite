@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -183,6 +184,71 @@ func substituteHeaders(req *http.Request, secrets []SecretConfig) {
 	if req.URL != nil && req.URL.RawQuery != "" {
 		req.URL.RawQuery = r.Replace(req.URL.RawQuery)
 	}
+
+	substituteBasicAuth(req, r)
+}
+
+// substituteBasicAuth rewrites `Authorization: Basic <base64>` headers whose
+// decoded credentials carry a placeholder.
+//
+// The loop above matches placeholders literally, which covers every scheme
+// that puts the credential in the clear (`Bearer <ph>`, `token <ph>`, an API
+// key header). HTTP Basic does not: RFC 7617 base64-encodes `user:password`,
+// so a placeholder in either field is unreadable to a literal match and the
+// credential leaves the proxy as the text `<BOXLITE_SECRET:name>`. That is why
+// `git push` over HTTPS could not work with a placeholder credential — git
+// authenticates with Basic, and the forge rejected the placeholder as the
+// password.
+//
+// Host binding is unchanged. `secrets` has already been narrowed to this
+// request's host by SecretHostMatcher.SecretsForHost, so a secret bound
+// elsewhere is not in the replacer and cannot be substituted here.
+func substituteBasicAuth(req *http.Request, r *strings.Replacer) {
+	const key = "Authorization"
+	for i, v := range req.Header[key] {
+		if rewritten, ok := rewriteBasicCredentials(v, r); ok {
+			req.Header[key][i] = rewritten
+		}
+	}
+}
+
+// rewriteBasicCredentials returns the header value with placeholders inside
+// the base64 payload substituted, and whether anything changed.
+//
+// Deliberately conservative: a value that is not Basic, does not decode, or
+// decodes to something with no placeholder in it is returned unchanged rather
+// than re-encoded, so a header this proxy has no business touching goes
+// upstream byte for byte.
+func rewriteBasicCredentials(value string, r *strings.Replacer) (string, bool) {
+	const scheme = "Basic "
+	if len(value) < len(scheme) || !strings.EqualFold(value[:len(scheme)], scheme) {
+		return value, false
+	}
+
+	encoded := strings.TrimSpace(value[len(scheme):])
+	decoded, err := decodeBasicPayload(encoded)
+	if err != nil {
+		return value, false
+	}
+
+	// Substituting into the whole `user:password` string covers a placeholder
+	// in either field, and a payload with no colon at all — some clients send
+	// a bare token as the username, others as the password.
+	replaced := r.Replace(string(decoded))
+	if replaced == string(decoded) {
+		return value, false
+	}
+
+	return scheme + base64.StdEncoding.EncodeToString([]byte(replaced)), true
+}
+
+// decodeBasicPayload accepts padded (RFC 7617) and unpadded base64; clients in
+// the wild send both.
+func decodeBasicPayload(s string) ([]byte, error) {
+	if decoded, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return decoded, nil
+	}
+	return base64.RawStdEncoding.DecodeString(s)
 }
 
 // resolveUpstreamTLS returns the TLS config for upstream connections.
