@@ -17,13 +17,15 @@ use std::path::Path;
 /// * `dest` - Destination file path
 ///
 /// The destination always ends up with the source's mode, so a copied
-/// executable stays executable. See [`copy_permissions`] for why that needs
-/// saying.
+/// executable stays executable — on the skip path as well as the copy path.
+/// See [`copy_permissions`] for why that needs saying, and
+/// [`repair_mode_if_differs`] for why skipping is not enough.
 ///
 /// # Returns
 ///
 /// * `Ok(true)` - File was copied
-/// * `Ok(false)` - File was skipped (destination is up-to-date)
+/// * `Ok(false)` - File was skipped (destination is up-to-date; its mode may
+///   still have been repaired)
 /// * `Err(e)` - Copy failed
 ///
 /// # Example
@@ -53,8 +55,42 @@ pub fn copy_if_newer(src: &Path, dest: &Path) -> io::Result<bool> {
         copy_permissions(src, dest)?;
         Ok(true)
     } else {
+        repair_mode_if_differs(src, dest)?;
         Ok(false)
     }
+}
+
+/// On the skip path, give `dest` the source's mode if it does not have it.
+///
+/// A destination left by an older BoxLite's reflink copy is the exact case
+/// this is for: same size as the source, NEWER mtime (it was written after
+/// the source was installed), and mode `0664`. `should_copy_file` therefore
+/// skips it, and without this the box whose shim it is could never start
+/// again: every later start re-skips the same non-executable file.
+///
+/// Compared first rather than set unconditionally, so an up-to-date
+/// destination — the common case on every box restart — is not touched and
+/// its ctime does not churn.
+#[cfg(unix)]
+fn repair_mode_if_differs(src: &Path, dest: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let want = fs::metadata(src)?.permissions().mode() & 0o7777;
+    let have = fs::metadata(dest)?.permissions().mode() & 0o7777;
+    if want != have {
+        fs::set_permissions(dest, fs::Permissions::from_mode(want))?;
+    }
+    Ok(())
+}
+
+/// See the Unix variant. Only the read-only bit is portable here.
+#[cfg(not(unix))]
+fn repair_mode_if_differs(src: &Path, dest: &Path) -> io::Result<()> {
+    let want = fs::metadata(src)?.permissions();
+    if fs::metadata(dest)?.permissions().readonly() != want.readonly() {
+        fs::set_permissions(dest, want)?;
+    }
+    Ok(())
 }
 
 /// Give `dest` the same mode as `src`.
@@ -283,29 +319,72 @@ mod tests {
         assert_eq!(mode, 0o600, "copy must not widen the mode, got {mode:o}");
     }
 
-    /// Re-copying over a stale destination restores the source mode too — the
-    /// destination may have been left non-executable by an older BoxLite.
+    /// A destination an older BoxLite left non-executable is repaired even
+    /// though the copy is skipped.
+    ///
+    /// This is the real stale case: a pre-fix reflink wrote the shim at
+    /// `0664` AFTER the source was installed, so the destination has the same
+    /// size and a newer mtime, and `should_copy_file` says "up to date". The
+    /// copy path never runs, so only the skip path can fix the mode — and a
+    /// box whose shim is left `0664` can never start again.
+    ///
+    /// (A test whose destination differs in size does not reach this: it
+    /// takes the copy path, where `reflink` refuses the existing file with
+    /// `EEXIST` and `fs::copy` restores the mode by itself, fix or no fix.)
     #[cfg(unix)]
     #[test]
     fn test_copy_if_newer_repairs_mode_of_stale_destination() {
         use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, SystemTime};
 
         let dir = tempdir().unwrap();
         let src = dir.path().join("boxlite-shim");
         let dest = dir.path().join("boxlite-shim-copy");
 
-        fs::write(&dest, "old").unwrap();
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o664)).unwrap();
-
         fs::write(&src, "ELF-fake-binary-data").unwrap();
         fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
 
+        // Same content and size, written later, mode as a pre-fix reflink
+        // left it.
+        fs::write(&dest, "ELF-fake-binary-data").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o664)).unwrap();
+        let older = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+
         assert!(
-            copy_if_newer(&src, &dest).unwrap(),
-            "sizes differ, must copy"
+            !copy_if_newer(&src, &dest).unwrap(),
+            "same size and newer destination: the copy must be skipped"
         );
 
         let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o755, "stale destination must be re-permissioned");
+        assert_eq!(
+            mode, 0o755,
+            "a skipped stale destination must still get the source mode, got {mode:o}"
+        );
+    }
+
+    /// The skip path leaves an up-to-date destination alone, and never widens
+    /// a mode the source does not have.
+    #[cfg(unix)]
+    #[test]
+    fn test_copy_if_newer_skip_keeps_matching_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("libkrunfw.so.5");
+        let dest = dir.path().join("libkrunfw-copy");
+
+        fs::write(&src, "lib").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(copy_if_newer(&src, &dest).unwrap());
+        assert!(!copy_if_newer(&src, &dest).unwrap(), "second call skips");
+
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o644, "got {mode:o}");
     }
 }
