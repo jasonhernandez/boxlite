@@ -89,7 +89,12 @@ impl HealthProbe {
 
 /// A single task that observes one box's process for its whole life.
 pub(crate) struct BoxWatcher {
-    shim_pid: u32,
+    /// The shim launcher, pinned at construction (a pidfd on Linux). Built in
+    /// `new`, synchronously while the caller still vouches for the pid, not
+    /// in the spawned task: by the time the task first runs, the launcher may
+    /// have exited, been reaped by the shim handler's reaper thread and had
+    /// its number reused, and a monitor opened then would pin the stranger.
+    shim: Option<crate::util::ProcessMonitor>,
     state: Arc<RwLock<BoxState>>,
     /// Weak, and load-bearing. The task parks on the shim for the box's life, and
     /// `RuntimeImpl::Drop` runs `shutdown_sync` to kill shims. A strong `Arc`
@@ -111,7 +116,7 @@ impl BoxWatcher {
     /// a HEALTHCHECK and a reachable guest (the caller supplies the probe).
     pub(crate) fn new(bx: &BoxImpl, shim_pid: u32, health: Option<HealthProbe>) -> Self {
         Self {
-            shim_pid,
+            shim: Some(crate::util::ProcessMonitor::new(shim_pid)),
             state: Arc::clone(&bx.state),
             runtime: Arc::downgrade(&bx.runtime),
             shutdown: bx.shutdown_token.child_token(),
@@ -132,7 +137,11 @@ impl BoxWatcher {
     }
 
     async fn run(mut self) {
-        let shim = crate::util::ProcessMonitor::new(self.shim_pid);
+        // Taken out of `self` so the select arms can borrow it while
+        // `on_health_tick` borrows `self` mutably.
+        let Some(shim) = self.shim.take() else {
+            return;
+        };
         // Cloned so the nested probe select can watch shim-exit/cancellation with
         // locals while `on_health_tick` borrows `self` mutably.
         let shutdown = self.shutdown.clone();

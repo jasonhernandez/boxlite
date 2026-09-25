@@ -124,37 +124,27 @@ impl ShimHandler {
                 }
             }
         } else {
-            // Attached mode: use SIGTERM then SIGKILL with polling
-            // We don't have a Child handle, so we use waitpid/kill directly
-            unsafe {
-                libc::kill(self.pid as i32, libc::SIGTERM);
-            }
+            // Attached mode: we hold no Child, only a pid. Pin it with a
+            // ProcessMonitor (a pidfd on Linux) BEFORE signalling, and do every
+            // signal and wait through that. The same process may also run a
+            // reaper thread for this launcher (a dropped handler's, see Drop),
+            // which can reap it the instant it exits; after that the pid
+            // number can be reused, and a bare waitpid/kill(pid) here could
+            // then wait or SIGKILL an unrelated process.
+            let monitor = crate::util::ProcessMonitor::new(self.pid);
+            monitor.signal(libc::SIGTERM);
 
             // Poll for exit with timeout
             let start = std::time::Instant::now();
             loop {
-                let mut status: i32 = 0;
-                let result = unsafe { libc::waitpid(self.pid as i32, &mut status, libc::WNOHANG) };
-
-                if result > 0 {
-                    // Process exited gracefully (we reaped it)
+                if monitor.try_wait().is_some() {
+                    // Exited: reaped by us, or by its parent / reaper thread.
                     return Ok(());
                 }
-                if result < 0 {
-                    // Error - process may not be our child (common in attached mode)
-                    // Fall back to checking if process still exists
-                    let exists = crate::util::is_process_alive(self.pid);
-                    if !exists {
-                        return Ok(()); // Already dead
-                    }
-                }
-                // result == 0 means still running
 
                 if start.elapsed().as_millis() > GRACEFUL_SHUTDOWN_TIMEOUT_MS as u128 {
                     // Timeout - force kill
-                    unsafe {
-                        libc::kill(self.pid as i32, libc::SIGKILL);
-                    }
+                    monitor.signal(libc::SIGKILL);
                     return Ok(());
                 }
 
@@ -192,10 +182,16 @@ impl Drop for ShimHandler {
     ///
     /// The wait is scoped to this one pid, which this handler alone spawned —
     /// never `waitpid(-1)`, so it cannot consume any other child's status. The
-    /// only other waiters on the same pid are boxlite's own pid-scoped polls
-    /// (the box watcher, and `graceful_stop` in attach mode). Both discard the
-    /// status and treat `ECHILD` as "exited", so losing the race to this thread
-    /// costs them nothing.
+    /// only other waiters on the same pid are boxlite's own: the box watcher
+    /// and `graceful_stop` in attach mode. Losing the race to this thread costs
+    /// them the exit *code* (they record the guest's exit file instead, and
+    /// report `ProcessExit::Unknown`), and it would also free the pid number
+    /// for reuse while they still poll it. So both go through
+    /// [`ProcessMonitor`](crate::util::ProcessMonitor), which pins the process
+    /// with a pidfd when it is built and never trusts the bare number after
+    /// that. On a system without pidfds (pre-5.3 kernels, macOS) they fall
+    /// back to the number, and a reuse inside one 500 ms poll could make the
+    /// watcher see a stranger as the running box.
     ///
     /// Blocking in a thread rather than a tokio task, because the runtime that
     /// owned this handler — and its cancellation token — may already be gone;
