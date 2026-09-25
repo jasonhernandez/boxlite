@@ -52,12 +52,65 @@ pub enum ProcessExit {
 /// ```
 pub struct ProcessMonitor {
     pid: u32,
+    /// A pidfd for the process, opened when the monitor is built. It names
+    /// that one process, not whatever later holds the same pid number.
+    ///
+    /// A bare pid is not a stable identity once somebody else may reap the
+    /// process: the shim launcher's own reaper thread (see
+    /// `ShimHandler`'s Drop) waits it the moment it exits, and the kernel may
+    /// then hand the number to an unrelated process. A monitor that only had
+    /// the number would see that stranger through `kill(pid, 0)` and report
+    /// the box running forever. Through the pidfd it sees the exit instead,
+    /// and `waitid(P_PIDFD)` can only ever reap the process it names.
+    ///
+    /// `None` when `pidfd_open` is unavailable (not Linux, a kernel before
+    /// 5.3, or the pid is already gone): then the monitor falls back to the
+    /// bare pid, as before.
+    #[cfg(target_os = "linux")]
+    pidfd: Option<std::os::fd::OwnedFd>,
+}
+
+/// `idtype_t` for `waitid` on a pidfd (Linux 5.4). Not exported by `libc`.
+#[cfg(target_os = "linux")]
+const P_PIDFD: libc::idtype_t = 3;
+
+#[cfg(target_os = "linux")]
+fn pidfd_open(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: pidfd_open returned a fresh descriptor that we now own.
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// Has the process behind `pidfd` exited? A pidfd polls readable once it
+/// has, whether or not it has been reaped since — so this stays true even
+/// after the pid number has been reused.
+#[cfg(target_os = "linux")]
+fn pidfd_exited(pidfd: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+    n > 0 && (pfd.revents & libc::POLLIN) != 0
 }
 
 impl ProcessMonitor {
     /// Create a new process monitor for the given PID.
+    ///
+    /// Build it while `pid` still names the process you mean — before it can
+    /// have been reaped — so the pidfd pins that process.
     pub fn new(pid: u32) -> Self {
-        Self { pid }
+        Self {
+            pid,
+            #[cfg(target_os = "linux")]
+            pidfd: pidfd_open(pid),
+        }
     }
 
     /// Get the monitored process ID.
@@ -67,7 +120,34 @@ impl ProcessMonitor {
 
     /// Check if the process is still alive.
     pub fn is_alive(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.pidfd {
+            return !pidfd_exited(fd);
+        }
         is_process_alive(self.pid)
+    }
+
+    /// Send `sig` to the monitored process — through the pidfd when there is
+    /// one, so it can only ever reach that process and never a later holder of
+    /// the same pid number. Best-effort: an already-exited process is fine.
+    pub fn signal(&self, sig: i32) {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.pidfd {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    sig,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                );
+            }
+            return;
+        }
+        unsafe {
+            libc::kill(self.pid as i32, sig);
+        }
     }
 
     /// Try to reap the process and get exit code (non-blocking).
@@ -75,9 +155,15 @@ impl ProcessMonitor {
     /// # Returns
     ///
     /// - `Some(ProcessExit::Code(n))` - Process exited, we got the code
-    /// - `Some(ProcessExit::Unknown)` - Process dead, but we're not parent (ECHILD)
+    /// - `Some(ProcessExit::Unknown)` - Process dead, but we're not parent
+    ///   (ECHILD), or somebody else already reaped it
     /// - `None` - Process still running
     pub fn try_wait(&self) -> Option<ProcessExit> {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.pidfd {
+            return Self::try_wait_pidfd(fd);
+        }
+
         let mut status: i32 = 0;
         let result = unsafe { libc::waitpid(self.pid as i32, &mut status, libc::WNOHANG) };
 
@@ -89,6 +175,43 @@ impl ProcessMonitor {
             Some(ProcessExit::Unknown)
         } else {
             // Still running (result == 0) or error but still alive
+            None
+        }
+    }
+
+    /// `try_wait` through the pidfd: reap only the process it names, and
+    /// judge liveness by it rather than by the pid number.
+    #[cfg(target_os = "linux")]
+    fn try_wait_pidfd(fd: &std::os::fd::OwnedFd) -> Option<ProcessExit> {
+        use std::os::fd::AsRawFd;
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                P_PIDFD,
+                fd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG,
+            )
+        };
+        if r == 0 {
+            // WNOHANG with nothing to report leaves si_pid zero.
+            if unsafe { info.si_pid() } == 0 {
+                return None;
+            }
+            let status = unsafe { info.si_status() };
+            let code = match info.si_code {
+                libc::CLD_EXITED => status,
+                libc::CLD_KILLED | libc::CLD_DUMPED => 128 + status,
+                _ => -1,
+            };
+            return Some(ProcessExit::Code(code));
+        }
+        // ECHILD: not our child, or already reaped by someone else (the
+        // launcher's reaper thread). Either way the pidfd still knows
+        // whether *this* process has exited.
+        if pidfd_exited(fd) {
+            Some(ProcessExit::Unknown)
+        } else {
             None
         }
     }
@@ -425,6 +548,87 @@ mod tests {
             Some(ProcessExit::Code(code)) => assert_eq!(code, 42),
             other => panic!("Expected ProcessExit::Code(42), got {:?}", other),
         }
+    }
+
+    /// The #140 review case: the launcher is reaped by somebody else (the
+    /// shim handler's reaper thread) and its pid number is reused before the
+    /// watcher's next poll. The monitor must report the exit, not the
+    /// stranger now holding the number.
+    ///
+    /// Real pid reuse cannot be forced here, so the stranger is simulated:
+    /// the monitor's pid number is pointed at a process that is certainly
+    /// alive (this test process) while its pidfd pins the dead child. A
+    /// monitor that trusted the bare pid would say "running"; this one must
+    /// say "exited".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_monitor_sees_exit_through_the_pidfd_after_pid_reuse() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let monitor = ProcessMonitor {
+            pid: std::process::id(), // the "reused" number: alive
+            pidfd: pidfd_open(child.id()),
+        };
+        assert!(monitor.pidfd.is_some(), "pidfd_open unsupported here");
+        // Someone else reaps it, as the reaper thread would.
+        child.wait().expect("wait");
+
+        assert!(
+            is_process_alive(monitor.pid),
+            "precondition: the bare pid number names a live process"
+        );
+        assert_eq!(monitor.try_wait(), Some(ProcessExit::Unknown));
+        assert!(!monitor.is_alive());
+    }
+
+    /// And the reaper-first race without reuse: the monitor's own
+    /// `waitid(P_PIDFD)` gets ECHILD and still reports the exit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_monitor_reports_exit_when_someone_else_reaped_it() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let monitor = ProcessMonitor::new(child.id());
+        child.wait().expect("wait");
+        assert_eq!(monitor.try_wait(), Some(ProcessExit::Unknown));
+    }
+
+    /// While alive, the pidfd path reports running and reaps nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_monitor_pidfd_reports_running_child_as_running() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let monitor = ProcessMonitor::new(child.id());
+        assert!(monitor.try_wait().is_none());
+        assert!(monitor.is_alive());
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::zombie_processes)] // try_wait reaps it through the pidfd
+    fn process_monitor_pidfd_reports_signal_exit_code() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let monitor = ProcessMonitor::new(child.id());
+        unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+        let start = std::time::Instant::now();
+        let exit = loop {
+            if let Some(e) = monitor.try_wait() {
+                break e;
+            }
+            assert!(start.elapsed().as_secs() < 5, "no exit seen");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(exit, ProcessExit::Code(128 + libc::SIGKILL));
     }
 
     #[test]

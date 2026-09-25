@@ -124,37 +124,27 @@ impl ShimHandler {
                 }
             }
         } else {
-            // Attached mode: use SIGTERM then SIGKILL with polling
-            // We don't have a Child handle, so we use waitpid/kill directly
-            unsafe {
-                libc::kill(self.pid as i32, libc::SIGTERM);
-            }
+            // Attached mode: we hold no Child, only a pid. Pin it with a
+            // ProcessMonitor (a pidfd on Linux) BEFORE signalling, and do every
+            // signal and wait through that. The same process may also run a
+            // reaper thread for this launcher (a dropped handler's, see Drop),
+            // which can reap it the instant it exits; after that the pid
+            // number can be reused, and a bare waitpid/kill(pid) here could
+            // then wait or SIGKILL an unrelated process.
+            let monitor = crate::util::ProcessMonitor::new(self.pid);
+            monitor.signal(libc::SIGTERM);
 
             // Poll for exit with timeout
             let start = std::time::Instant::now();
             loop {
-                let mut status: i32 = 0;
-                let result = unsafe { libc::waitpid(self.pid as i32, &mut status, libc::WNOHANG) };
-
-                if result > 0 {
-                    // Process exited gracefully (we reaped it)
+                if monitor.try_wait().is_some() {
+                    // Exited: reaped by us, or by its parent / reaper thread.
                     return Ok(());
                 }
-                if result < 0 {
-                    // Error - process may not be our child (common in attached mode)
-                    // Fall back to checking if process still exists
-                    let exists = crate::util::is_process_alive(self.pid);
-                    if !exists {
-                        return Ok(()); // Already dead
-                    }
-                }
-                // result == 0 means still running
 
                 if start.elapsed().as_millis() > GRACEFUL_SHUTDOWN_TIMEOUT_MS as u128 {
                     // Timeout - force kill
-                    unsafe {
-                        libc::kill(self.pid as i32, libc::SIGKILL);
-                    }
+                    monitor.signal(libc::SIGKILL);
                     return Ok(());
                 }
 
@@ -164,6 +154,75 @@ impl ShimHandler {
 
         #[allow(unreachable_code)]
         Ok(())
+    }
+}
+
+/// Stack for the thread that waits a dropped shim. It only ever sits in
+/// `waitpid`, so the default 2 MiB would be pure address-space waste — and a
+/// detached box keeps its thread for as long as the box runs.
+const REAPER_STACK_BYTES: usize = 64 * 1024;
+
+impl Drop for ShimHandler {
+    /// Wait the spawned launcher even though nobody called `stop()`.
+    ///
+    /// This process forked the outer `bwrap`, so only this process can reap
+    /// it, and `std::process::Child` does not wait on drop. A handler dropped
+    /// without `stop()` therefore turns the launcher into a zombie the moment
+    /// it exits — for the life of this process, since nothing else will ever
+    /// `waitpid` that pid.
+    ///
+    /// That is the ordinary lifecycle of a *detached* box driven by a
+    /// short-lived runtime: the runtime spawns the shim, hands back a handle,
+    /// and is dropped (it must be — a runtime holds `BOXLITE_HOME`'s exclusive
+    /// lock, so a long-lived host process cannot keep one open). Dropping the
+    /// runtime cancels the box watcher, which is the only other thing that
+    /// would have reaped the pid. The box is then stopped later from another
+    /// process, the launcher exits, and it stays `<defunct>` under the host
+    /// process forever: one per box, unbounded in the host's uptime.
+    ///
+    /// The wait is scoped to this one pid, which this handler alone spawned —
+    /// never `waitpid(-1)`, so it cannot consume any other child's status. The
+    /// only other waiters on the same pid are boxlite's own: the box watcher
+    /// and `graceful_stop` in attach mode. Losing the race to this thread costs
+    /// them the exit *code* (they record the guest's exit file instead, and
+    /// report `ProcessExit::Unknown`), and it would also free the pid number
+    /// for reuse while they still poll it. So both go through
+    /// [`ProcessMonitor`](crate::util::ProcessMonitor), which pins the process
+    /// with a pidfd when it is built and never trusts the bare number after
+    /// that. On a system without pidfds (pre-5.3 kernels, macOS) they fall
+    /// back to the number, and a reuse inside one 500 ms poll could make the
+    /// watcher see a stranger as the running box.
+    ///
+    /// Blocking in a thread rather than a tokio task, because the runtime that
+    /// owned this handler — and its cancellation token — may already be gone;
+    /// a plain thread depends on neither. It lives exactly as long as the
+    /// launcher does.
+    fn drop(&mut self) {
+        let Some(mut child) = self.process.take() else {
+            return; // attached by pid, or already waited by stop()
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {} // already exited: try_wait just reaped it
+            Ok(None) => {
+                let pid = self.pid;
+                let spawned = std::thread::Builder::new()
+                    .name(format!("boxlite-reap-{pid}"))
+                    .stack_size(REAPER_STACK_BYTES)
+                    .spawn(move || {
+                        let _ = child.wait();
+                    });
+                if let Err(e) = spawned {
+                    tracing::warn!(
+                        pid,
+                        error = %e,
+                        "Could not start a thread to wait the shim launcher; \
+                         it will stay a zombie after it exits"
+                    );
+                }
+            }
+            // ECHILD: somebody already reaped it. Nothing left to wait.
+            Err(_) => {}
+        }
     }
 }
 
@@ -399,8 +458,8 @@ impl VmmController for ShimController {
             "VM subprocess started successfully"
         );
 
-        // Note: Child is dropped here, but process continues running
-        // Handler manages it by PID
+        // The handler owns the Child from here: stop() waits it, and a handler
+        // dropped without stop() hands it to a reaper thread (see its Drop).
         Ok(Box::new(handler))
     }
 }
@@ -431,6 +490,126 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    /// The kernel's view of `pid`: its `/proc/<pid>/stat` state letter, or
+    /// `None` once the pid is gone. A zombie still has a `/proc` entry — state
+    /// `Z` — so "gone" means somebody reaped it, which is what these tests
+    /// are about.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // `pid (comm) S ...` — comm may contain spaces and parens, so take
+        // the state after the LAST `)`.
+        stat.rsplit_once(')')?.1.trim_start().chars().next()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn handler_for(child: std::process::Child) -> ShimHandler {
+        ShimHandler::from_spawned(
+            SpawnedShim {
+                child,
+                keepalive: None,
+            },
+            BoxID::parse("reaptestbox1").expect("valid box id"),
+        )
+    }
+
+    /// Poll until `pid` leaves the process table, or give up at `deadline`.
+    #[cfg(target_os = "linux")]
+    fn gone_within(pid: u32, deadline: std::time::Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if proc_state(pid).is_none() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// The #140 leak: a handler dropped without `stop()` — the normal fate of
+    /// a detached box's handler once its short-lived runtime goes away — must
+    /// still get its launcher reaped when that launcher exits later, from a
+    /// kill this process had no part in. Without the Drop impl the pid sits
+    /// in state `Z` indefinitely, and this test fails on the deadline.
+    ///
+    /// Revert procedure: delete `impl Drop for ShimHandler`. The pid then
+    /// stays `Z` and the assertion fires.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropped_handler_reaps_its_launcher_after_it_exits() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        drop(handler_for(child));
+        // Still running: the drop must not have killed or blocked on it.
+        assert!(
+            matches!(proc_state(pid), Some(s) if s != 'Z'),
+            "dropping the handler must leave a live launcher alone"
+        );
+
+        // The box is stopped from elsewhere — another process's `stop()`.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+
+        let reaped = gone_within(pid, std::time::Duration::from_secs(5));
+        if !reaped {
+            // Do not leak the zombie into the rest of the test binary.
+            unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
+        }
+        assert!(
+            reaped,
+            "a dropped handler's launcher stayed <defunct> after it exited \
+             (state {:?}) — nothing waited it",
+            proc_state(pid)
+        );
+    }
+
+    /// A launcher that has already exited when its handler drops is reaped on
+    /// the spot, without a thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropped_handler_reaps_an_already_exited_launcher() {
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        // Let it exit and become a zombie before the drop.
+        let start = Instant::now();
+        while proc_state(pid) != Some('Z') && start.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(proc_state(pid), Some('Z'), "precondition: a zombie");
+
+        drop(handler_for(child));
+        assert_eq!(
+            proc_state(pid),
+            None,
+            "dropping the handler must reap a launcher that already exited"
+        );
+    }
+
+    /// `stop()` still owns the wait. Afterwards the Drop impl has nothing
+    /// left to do, so it must not start a second waiter on a pid that may
+    /// already be reused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_waits_the_launcher_itself_and_leaves_drop_nothing() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut handler = handler_for(child);
+        // The graceful half is what matters here; the cgroup sweep
+        // `stop()` also runs is best-effort and finds no such box.
+        handler.graceful_stop().expect("graceful stop");
+        assert_eq!(proc_state(pid), None, "stop() must reap the launcher");
+        assert!(handler.process.is_none(), "stop() must consume the Child");
+        drop(handler);
     }
 
     /// Behavioral regression for the leak fixed in this commit: feed a
